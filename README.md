@@ -1,4 +1,4 @@
-# tangible-anatomy-supplementary-material
+# Adaptive Volumetric Anatomy Visualization in VR with Tangible Control
 Supplementary Material for "Adaptive Volumetric Anatomy Visualization in VR with Tangible Control"
 
 This repository builds upon the [work by Matias Lavik](https://github.com/mlavik1/UnityVolumeRendering) and contains: 
