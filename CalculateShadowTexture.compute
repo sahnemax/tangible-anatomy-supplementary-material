@@ -1,0 +1,153 @@
+#pragma kernel CalculateShadowTex
+
+sampler3D _DataTex;
+sampler2D _TFTex;
+sampler3D _MaskTex;
+int _HasMask;
+float3 _DataTextureSize;
+
+float _MinVal = 0;
+float _MaxVal = 1;
+
+RWTexture3D<float> Result;
+
+int shadowTextureSize;
+float3 worldLightPos;
+float3 worldLightDir;
+float4x4 worldToObject;
+
+float4x4 _CrossSectionMatrices[8];
+float _CrossSectionTypes[8];
+int _NumCrossSections = 0;
+
+struct RayInfo
+{
+    float3 startPos;
+    float3 endPos;
+    float3 direction;
+    float2 aabbInters;
+};
+
+struct RaymarchInfo
+{
+    RayInfo ray;
+    int numSteps;
+    float numStepsRecip;
+    float stepSize;
+};
+
+inline float3 getLightPosition()
+{
+    return normalize(mul(worldToObject, float4(worldLightPos.xyz, 1)).xyz);
+}
+
+inline float3 getLightDirection()
+{
+    return normalize(mul(worldToObject, -worldLightDir.xyz).xyz);
+}
+
+RaymarchInfo initRaymarch(RayInfo ray, int maxNumSteps)
+{
+    RaymarchInfo raymarchInfo;
+    raymarchInfo.stepSize = 1.732f /*greatest distance in box*/ / maxNumSteps;
+    raymarchInfo.numSteps = (int)clamp(distance(ray.startPos, ray.endPos) / raymarchInfo.stepSize, 1, maxNumSteps);
+    raymarchInfo.numStepsRecip = 1.0 / raymarchInfo.numSteps;
+    return raymarchInfo;
+}
+
+float4 getTF1DColour(float density)
+{
+    return tex2Dlod(_TFTex, float4(density, 0.0f, 0.0f, 0.0f));
+}
+
+float getDensity(float3 pos)
+{
+    return tex3Dlod(_DataTex, float4(pos.x, pos.y, pos.z, 0.0f));
+}
+
+float getMask(float3 pos)
+{
+    return tex3Dlod(_MaskTex, float4(pos.x, pos.y, pos.z, 0.0f));
+}
+
+bool IsCutout(float3 currPos)
+{
+    // Move the reference in the middle of the mesh, like the pivot
+    float4 pos = float4(currPos - float3(0.5f, 0.5f, 0.5f), 1.0f);
+
+    bool clipped = false;
+    for (int i = 0; i < _NumCrossSections && !clipped; ++i)
+    {
+        const int type = (int)_CrossSectionTypes[i];
+        const float4x4 mat = _CrossSectionMatrices[i];
+
+        // Convert from model space to plane's vector space
+        float3 planeSpacePos = mul(mat, pos);
+        clipped = planeSpacePos.z > 0.0f;
+    }
+    return clipped;
+}
+
+float getTransmittance(RayInfo ray)
+{
+    #define ATTENUATION_NUM_STEPS 64
+    #define ATTENUATION_COEFFICIENT 2
+    
+    RaymarchInfo raymarchInfo = initRaymarch(ray, ATTENUATION_NUM_STEPS);
+
+    float transmittance = 1.0f;
+    float occlusion = 0;
+    float3 currPos;
+    for (int iStep = 1; iStep < raymarchInfo.numSteps; iStep++)
+    {
+        const float t = iStep * raymarchInfo.numStepsRecip;
+        currPos = lerp(ray.startPos, ray.endPos, t);
+        const float density = getDensity(currPos);
+        if (density < _MinVal || density > _MaxVal || IsCutout(currPos)) continue;
+        if (_HasMask > 0 && getMask(currPos) < 0.5) continue;
+        const float visibility = getTF1DColour(density).a;
+
+        occlusion = (1.0f - occlusion) * visibility + occlusion;
+        transmittance *= exp(-visibility * ATTENUATION_COEFFICIENT * raymarchInfo.stepSize);
+    }
+    return exp(ATTENUATION_COEFFICIENT * (-occlusion)) * clamp(transmittance, 0.2, 1);
+}
+
+float2 intersectAABB(float3 rayOrigin, float3 rayDir, float3 boxMin, float3 boxMax)
+{
+    float3 tMin = (boxMin - rayOrigin) / rayDir;
+    float3 tMax = (boxMax - rayOrigin) / rayDir;
+    float3 t1 = min(tMin, tMax);
+    float3 t2 = max(tMin, tMax);
+    float tNear = max(max(t1.x, t1.y), t1.z);
+    float tFar = min(min(t2.x, t2.y), t2.z);
+    return float2(tNear, tFar);
+};
+
+
+RayInfo getAttenuationRay(float3 posInCube)
+{
+    RayInfo ray;
+    ray.direction = getLightDirection();
+    ray.startPos = posInCube; 
+    // Find intersections with axis aligned bounding box (the volume)
+    ray.aabbInters = intersectAABB(ray.startPos, ray.direction, float3(0.0, 0.0, 0.0), float3(1.0f, 1.0f, 1.0));
+    ray.endPos = ray.startPos + ray.direction * ray.aabbInters.y;
+    return ray;
+}
+
+[numthreads(8,8,8)]
+void CalculateShadowTex(int3 id : SV_DispatchThreadID)
+{
+    if (id.x >= shadowTextureSize || id.y >= shadowTextureSize || id.z >= shadowTextureSize)
+    {
+        return;
+    }
+    float3 currPos = (float3(id) + float3(0.5, 0.5, 0.5)) / shadowTextureSize;
+
+    RayInfo att_ray = getAttenuationRay(currPos);
+    float transmittance = getTransmittance(att_ray);
+    
+    Result[id] = transmittance;
+
+}
